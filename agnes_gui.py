@@ -1,5 +1,7 @@
 import json
+import mimetypes
 import os
+import re
 import sys
 import traceback
 import uuid
@@ -9,7 +11,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import requests
 from PyQt5.QtCore import QObject, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, QUrl, pyqtSignal
-from PyQt5.QtGui import QDesktopServices, QIcon, QPixmap
+from PyQt5.QtGui import QDesktopServices, QIcon, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -44,6 +46,60 @@ DEFAULT_BASE_URL = "https://apihub.agnes-ai.com"
 TEXT_MODEL = "agnes-2.0-flash"
 IMAGE_MODEL = "agnes-image-2.0-flash"
 VIDEO_MODEL = "agnes-video-v2.0"
+HTTP_URL_RE = re.compile(r"https?://[^\s\"'<>]+")
+VIDEO_URL_KEYS = (
+    "video_url",
+    "videoUrl",
+    "videoURL",
+    "download_url",
+    "downloadUrl",
+    "output_url",
+    "outputUrl",
+    "file_url",
+    "fileUrl",
+)
+VIDEO_CONTAINER_KEYS = (
+    "data",
+    "result",
+    "results",
+    "output",
+    "outputs",
+    "video",
+    "videos",
+    "asset",
+    "assets",
+    "content",
+)
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".m3u8", ".avi", ".mkv")
+CATBOX_UPLOAD_ENDPOINT = "https://catbox.moe/user/api.php"
+NULL_POINTER_UPLOAD_ENDPOINT = "https://0x0.st"
+TMPFILES_UPLOAD_ENDPOINT = "https://tmpfiles.org/api/v1/upload"
+DEFAULT_IMAGE_UPLOAD_ENDPOINT = "auto"
+AUTO_IMAGE_UPLOAD_ENDPOINTS = (TMPFILES_UPLOAD_ENDPOINT, CATBOX_UPLOAD_ENDPOINT)
+IMAGE_UPLOAD_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+
+
+def default_data_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        root = Path(sys.executable).resolve().parent
+    else:
+        root = Path(__file__).resolve().parent
+    return root / "agnes_data"
+
+
+def legacy_app_data_dir() -> Path:
+    base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+    root = Path(base) if base else Path.home()
+    return root / "SapiensAI" / "AgnesModelTester"
+
+
+def normalize_data_dir(value: Any) -> Path:
+    text = str(value or "").strip()
+    return Path(text).expanduser() if text else default_data_dir()
+
+
+def sessions_file_path(data_dir: Optional[Any] = None) -> Path:
+    return normalize_data_dir(data_dir) / "sessions.json"
 
 
 def asset_path(filename: str) -> str:
@@ -407,8 +463,138 @@ def pretty_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2)
 
 
+def json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, bytes):
+        return ""
+    return str(value)
+
+
 def parse_urls(text: str) -> List[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def append_urls(existing: str, urls: List[str]) -> str:
+    values = parse_urls(existing)
+    seen = set(values)
+    for url in urls:
+        if url and url not in seen:
+            values.append(url)
+            seen.add(url)
+    return "\n".join(values)
+
+
+def is_null_pointer_endpoint(endpoint: str) -> bool:
+    cleaned = endpoint.strip().rstrip("/").lower()
+    return cleaned in {"https://0x0.st", "http://0x0.st", "https://0x0.black", "http://0x0.black"}
+
+
+def is_tmpfiles_endpoint(endpoint: str) -> bool:
+    return endpoint.strip().rstrip("/").lower() == TMPFILES_UPLOAD_ENDPOINT
+
+
+def is_auto_upload_endpoint(endpoint: str) -> bool:
+    cleaned = endpoint.strip().lower()
+    return cleaned in {"", "auto", "自动"}
+
+
+def tmpfiles_direct_url(url: str) -> str:
+    marker = "tmpfiles.org/"
+    if marker not in url or "tmpfiles.org/dl/" in url:
+        return url
+    return "https://tmpfiles.org/dl/" + url.split(marker, 1)[1].lstrip("/")
+
+
+def upload_image_file(path: str, endpoint: str = DEFAULT_IMAGE_UPLOAD_ENDPOINT) -> str:
+    if is_auto_upload_endpoint(endpoint):
+        errors = []
+        for candidate in AUTO_IMAGE_UPLOAD_ENDPOINTS:
+            try:
+                return upload_image_file(path, candidate)
+            except Exception as exc:
+                errors.append(f"{candidate}: {exc}")
+        raise RuntimeError("所有内置图床上传均失败：" + "；".join(errors))
+
+    image_path = Path(path)
+    if not image_path.exists() or not image_path.is_file():
+        raise ValueError(f"文件不存在：{image_path}")
+    if image_path.suffix.lower() not in IMAGE_UPLOAD_EXTENSIONS:
+        raise ValueError(f"只支持上传图片文件：{image_path.name}")
+
+    mime_type = mimetypes.guess_type(str(image_path))[0] or "application/octet-stream"
+    with image_path.open("rb") as handle:
+        if is_tmpfiles_endpoint(endpoint):
+            response = requests.post(
+                endpoint,
+                data={"expire": "21600"},
+                files={"file": (image_path.name, handle, mime_type)},
+                timeout=120,
+            )
+        elif is_null_pointer_endpoint(endpoint):
+            response = requests.post(
+                endpoint,
+                files={"file": (image_path.name, handle, mime_type)},
+                timeout=120,
+            )
+        else:
+            response = requests.post(
+                endpoint,
+                data={"reqtype": "fileupload"},
+                files={"fileToUpload": (image_path.name, handle, mime_type)},
+                timeout=120,
+            )
+    if not response.ok:
+        raise RuntimeError(f"图床上传失败：HTTP {response.status_code} {response.text[:200]}")
+    if is_tmpfiles_endpoint(endpoint):
+        try:
+            url = str(response.json().get("data", {}).get("url", ""))
+        except (ValueError, AttributeError):
+            url = ""
+        url = tmpfiles_direct_url(_clean_http_url(url))
+    else:
+        url = _clean_http_url(response.text)
+    if not url:
+        raise RuntimeError(f"图床没有返回可用 URL：{response.text[:200]}")
+    return url
+
+
+def upload_image_to_catbox(path: str, endpoint: str = CATBOX_UPLOAD_ENDPOINT) -> str:
+    return upload_image_file(path, endpoint)
+
+
+def upload_images_to_catbox(paths: List[str], endpoint: str = DEFAULT_IMAGE_UPLOAD_ENDPOINT) -> List[str]:
+    return [upload_image_file(path, endpoint) for path in paths]
+
+
+def prepare_video_image(path: str, width: int, height: int, output_dir: Path) -> str:
+    source = Path(path)
+    image = QImage(str(source))
+    if image.isNull():
+        raise ValueError(f"无法读取图片：{source}")
+    if width <= 0 or height <= 0:
+        raise ValueError("视频宽高必须大于 0。")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    scaled = image.convertToFormat(QImage.Format_RGB888).scaled(
+        width,
+        height,
+        Qt.KeepAspectRatioByExpanding,
+        Qt.SmoothTransformation,
+    )
+    left = max(0, (scaled.width() - width) // 2)
+    top = max(0, (scaled.height() - height) // 2)
+    cropped = scaled.copy(left, top, width, height)
+    output_path = output_dir / f"{source.stem}-{uuid.uuid4().hex[:8]}-{width}x{height}.jpg"
+    if not cropped.save(str(output_path), "JPEG", 92):
+        raise RuntimeError(f"图片转存失败：{output_path}")
+    return str(output_path)
 
 
 def optional_int(value: int, enabled: bool) -> Optional[int]:
@@ -456,6 +642,58 @@ def extract_delta_reasoning(delta: Dict[str, Any]) -> str:
         reasoning = extract_reasoning_text(delta.get(key))
         if reasoning:
             return reasoning
+    return ""
+
+
+def _clean_http_url(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    match = HTTP_URL_RE.search(value.strip())
+    if not match:
+        return ""
+    return match.group(0).rstrip(".,;)]}")
+
+
+def _looks_like_video_url(url: str) -> bool:
+    lower = url.split("?", 1)[0].split("#", 1)[0].lower()
+    return lower.endswith(VIDEO_EXTENSIONS) or "/video" in lower or "video_" in lower
+
+
+def extract_video_url(payload: Any, in_video_context: bool = False) -> str:
+    if isinstance(payload, dict):
+        for key in VIDEO_URL_KEYS:
+            if key not in payload:
+                continue
+            key_lower = key.lower()
+            found = extract_video_url(
+                payload[key],
+                in_video_context or "video" in key_lower,
+            )
+            if found:
+                return found
+
+        for key, value in payload.items():
+            key_lower = str(key).lower()
+            key_video_context = in_video_context or "video" in key_lower or key_lower in VIDEO_CONTAINER_KEYS
+            if ("url" in key_lower or "uri" in key_lower or "link" in key_lower) and isinstance(value, str):
+                candidate = _clean_http_url(value)
+                if candidate and (key_video_context or _looks_like_video_url(candidate)):
+                    return candidate
+            found = extract_video_url(value, key_video_context)
+            if found:
+                return found
+        return ""
+
+    if isinstance(payload, list):
+        for item in payload:
+            found = extract_video_url(item, in_video_context)
+            if found:
+                return found
+        return ""
+
+    candidate = _clean_http_url(payload)
+    if candidate and (in_video_context or _looks_like_video_url(candidate)):
+        return candidate
     return ""
 
 
@@ -1361,6 +1599,24 @@ class SettingsTab(QWidget):
         note.setWordWrap(True)
         form.addRow("", note)
 
+        form.addRow(self._heading("数据保存"))
+        data_dir_row = QHBoxLayout()
+        data_dir_row.addWidget(self.window.data_dir, 1)
+        browse_data_dir = QPushButton("选择目录")
+        browse_data_dir.setObjectName("subtleButton")
+        browse_data_dir.clicked.connect(self.choose_data_dir)
+        data_dir_row.addWidget(browse_data_dir)
+        form.addRow("历史数据目录", data_dir_row)
+        data_note = QLabel("对话、图像和视频工作室状态会保存到该目录下的 sessions.json。默认目录为程序同级 agnes_data。")
+        data_note.setObjectName("muted")
+        data_note.setWordWrap(True)
+        form.addRow("", data_note)
+        form.addRow("图片上传接口", self.window.image_upload_endpoint)
+        upload_note = QLabel("用于“上传本地图片并回填 URL”。默认 auto：优先 tmpfiles.org 直链，失败后尝试 Catbox；也可填写 Catbox 兼容的 reqtype=fileupload/fileToUpload 自有图床接口。")
+        upload_note.setObjectName("muted")
+        upload_note.setWordWrap(True)
+        form.addRow("", upload_note)
+
         actions = QHBoxLayout()
         self.save_button = QPushButton("保存设置")
         self.save_button.setObjectName("primaryButton")
@@ -1404,7 +1660,14 @@ class SettingsTab(QWidget):
         label.setObjectName("paneTitle")
         return label
 
+    def choose_data_dir(self) -> None:
+        current = str(self.window.data_dir_path())
+        chosen = QFileDialog.getExistingDirectory(self, "选择历史数据目录", current)
+        if chosen:
+            self.window.data_dir.setText(chosen)
+
     def save(self) -> None:
+        self.window.save_sessions()
         self.window.save_settings()
         self.window.statusBar().showMessage("连接设置已保存", 4000)
 
@@ -1500,7 +1763,6 @@ class ImageTab(QWidget):
             "seed": self.seed.value(),
             "input_urls": self.input_urls.toPlainText(),
             "current_url": self.current_url,
-            "current_bytes": self.current_bytes,
             "raw": self.raw.toPlainText(),
         }
 
@@ -1511,7 +1773,8 @@ class ImageTab(QWidget):
         self.seed.setValue(int(state.get("seed", 0)))
         self.input_urls.setPlainText(str(state.get("input_urls", "")))
         self.current_url = str(state.get("current_url", ""))
-        self.current_bytes = state.get("current_bytes", b"") or b""
+        stored_bytes = state.get("current_bytes", b"")
+        self.current_bytes = stored_bytes if isinstance(stored_bytes, bytes) else b""
         self.result_url.setText(self.current_url)
         self.raw.setPlainText(str(state.get("raw", "")))
         self.open_button.setEnabled(bool(self.current_url))
@@ -1603,6 +1866,7 @@ class VideoTab(QWidget):
         super().__init__()
         self.window = window
         self.polling = False
+        self.uploading_images = False
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(5000)
         self.poll_timer.timeout.connect(self.retrieve)
@@ -1616,8 +1880,15 @@ class VideoTab(QWidget):
         self.workflow.addItem("多图引导视频", "multi")
         self.workflow.addItem("关键帧动画", "keyframes")
         self.input_urls = QTextEdit()
-        self.input_urls.setPlaceholderText("图生视频填写一个公开图片 URL；多图或关键帧动画每行填写一个 URL。")
+        self.input_urls.setPlaceholderText("可粘贴公开图片 URL，也可点击下方按钮上传本地图片后自动回填。每行一个 URL。")
         self.input_urls.setFixedHeight(74)
+        self.upload_image_button = QPushButton("上传本地图片并回填 URL")
+        self.upload_image_button.setObjectName("subtleButton")
+        self.upload_status = QLabel("本地图片会上传到第三方公开图床，获得公网 URL 后再提交给 Agnes。")
+        self.upload_status.setObjectName("muted")
+        self.upload_status.setWordWrap(True)
+        self.normalize_upload = QCheckBox("上传前转为视频尺寸 JPEG（兼容模式）")
+        self.normalize_upload.setChecked(False)
         self.negative_prompt = QLineEdit()
         self.negative_prompt.setPlaceholderText("可选：描述要避免的内容")
         self.width = self._spin(64, 4096, 1152)
@@ -1648,6 +1919,11 @@ class VideoTab(QWidget):
         form.addRow("工作流", self.workflow)
         form.addRow("Prompt", self.prompt)
         form.addRow("输入图片 URL", self.input_urls)
+        upload_row = QHBoxLayout()
+        upload_row.addWidget(self.upload_image_button)
+        upload_row.addWidget(self.normalize_upload)
+        upload_row.addWidget(self.upload_status, 1)
+        form.addRow("本地图片", upload_row)
         form.addRow("Negative Prompt", self.negative_prompt)
         dimensions = QHBoxLayout()
         dimensions.addWidget(QLabel("宽"))
@@ -1692,6 +1968,7 @@ class VideoTab(QWidget):
         self.submit_button.clicked.connect(self.submit)
         self.retrieve_button.clicked.connect(self.retrieve)
         self.open_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self.video_url.text())))
+        self.upload_image_button.clicked.connect(self.upload_local_images)
 
     @staticmethod
     def _spin(minimum: int, maximum: int, value: int) -> QSpinBox:
@@ -1707,6 +1984,55 @@ class VideoTab(QWidget):
         layout.addWidget(widget)
         return box
 
+    def upload_local_images(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择要上传的图片",
+            "",
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif);;All Files (*)",
+        )
+        if not paths:
+            return
+        if self.normalize_upload.isChecked():
+            try:
+                upload_paths = [
+                    prepare_video_image(path, self.width.value(), self.height.value(), self.window.data_dir_path() / "uploads")
+                    for path in paths
+                ]
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.window.warn(str(exc))
+                return
+            status_text = f"已转为 {self.width.value()}x{self.height.value()} JPEG，正在上传 {len(upload_paths)} 张图片..."
+        else:
+            upload_paths = paths
+            status_text = f"正在上传 {len(upload_paths)} 张原图..."
+        self.uploading_images = True
+        self.upload_image_button.setEnabled(False)
+        self.upload_status.setText(status_text)
+        endpoint = self.window.image_upload_endpoint.text().strip() or DEFAULT_IMAGE_UPLOAD_ENDPOINT
+        self.window.start_job(
+            lambda: upload_images_to_catbox(upload_paths, endpoint),
+            self._on_upload_result,
+            self._on_upload_error,
+            on_finished=self._upload_finished,
+        )
+
+    def _upload_finished(self) -> None:
+        self.uploading_images = False
+        self.upload_image_button.setEnabled(True)
+
+    def _on_upload_result(self, urls: List[str]) -> None:
+        self.input_urls.setPlainText(append_urls(self.input_urls.toPlainText(), urls))
+        total_urls = len(parse_urls(self.input_urls.toPlainText()))
+        if self.workflow.currentData() in {"text", "image"}:
+            self.workflow.setCurrentIndex(self.workflow.findData("image" if total_urls == 1 else "multi"))
+        self.upload_status.setText(f"已上传并回填 {len(urls)} 个 URL。")
+        self.window.save_sessions()
+
+    def _on_upload_error(self, message: str) -> None:
+        self.upload_status.setText("上传失败。")
+        self.window.warn(message)
+
     def export_state(self) -> Dict[str, Any]:
         return {
             "prompt": self.prompt.toPlainText(),
@@ -1721,6 +2047,7 @@ class VideoTab(QWidget):
             "steps": self.steps.value(),
             "seed_enabled": self.seed_enabled.isChecked(),
             "seed": self.seed.value(),
+            "normalize_upload": self.normalize_upload.isChecked(),
             "auto_poll": self.auto_poll.isChecked(),
             "task_id": self.task_id.text(),
             "status": self.status.text(),
@@ -1744,6 +2071,7 @@ class VideoTab(QWidget):
         self.steps.setValue(int(state.get("steps", 30)))
         self.seed_enabled.setChecked(bool(state.get("seed_enabled", False)))
         self.seed.setValue(int(state.get("seed", 0)))
+        self.normalize_upload.setChecked(bool(state.get("normalize_upload", False)))
         self.auto_poll.setChecked(bool(state.get("auto_poll", True)))
         self.task_id.setText(str(state.get("task_id", "")))
         self.status.setText(str(state.get("status", "尚未提交任务")))
@@ -1776,6 +2104,9 @@ class VideoTab(QWidget):
             self.window.warn(str(exc))
             return
         self.submit_button.setEnabled(False)
+        self.video_url.clear()
+        self.open_button.setEnabled(False)
+        self.status.setText("queued")
         self.window.start_job(
             lambda: client.create_video(payload),
             self._on_result,
@@ -1817,9 +2148,10 @@ class VideoTab(QWidget):
         progress = result.get("progress")
         suffix = f" · {progress}%" if progress is not None else ""
         self.status.setText(f"{status}{suffix}")
-        video_url = str(result.get("video_url", "") or "")
-        self.video_url.setText(video_url)
-        self.open_button.setEnabled(bool(video_url))
+        video_url = extract_video_url(result)
+        if video_url:
+            self.video_url.setText(video_url)
+        self.open_button.setEnabled(bool(self.video_url.text()))
         if status in self.TERMINAL_STATUSES:
             self.poll_timer.stop()
         elif self.auto_poll.isChecked() and task_id:
@@ -2036,6 +2368,13 @@ class MainWindow(QMainWindow):
         self.toggle_key.toggled.connect(
             lambda shown: self.api_key.setEchoMode(QLineEdit.Normal if shown else QLineEdit.Password)
         )
+        saved_data_dir = self.settings.value("data_dir", "")
+        self.data_dir = QLineEdit(str(normalize_data_dir(saved_data_dir)))
+        self.data_dir.setPlaceholderText(str(default_data_dir()))
+        saved_upload_endpoint = str(self.settings.value("image_upload_endpoint", "") or "").strip()
+        if saved_upload_endpoint in {CATBOX_UPLOAD_ENDPOINT, NULL_POINTER_UPLOAD_ENDPOINT}:
+            saved_upload_endpoint = ""
+        self.image_upload_endpoint = QLineEdit(saved_upload_endpoint or DEFAULT_IMAGE_UPLOAD_ENDPOINT)
 
         self.stack = QStackedWidget()
         self.text_tab = TextTab(self)
@@ -2066,7 +2405,16 @@ class MainWindow(QMainWindow):
         layout.addWidget(content, 1)
         self.setCentralWidget(central)
         self.statusBar().showMessage("就绪")
-        self.create_session()
+        self.load_sessions()
+        if self.sessions:
+            self.active_session_id = self.active_session_id or self.sessions[0]["id"]
+            session = self._active_session() or self.sessions[0]
+            self.active_session_id = session["id"]
+            self._load_session_workspace(session)
+            self._refresh_session_list()
+            self.switch_page(0)
+        else:
+            self.create_session()
 
     def _build_nav_rail(self) -> QWidget:
         rail = QFrame()
@@ -2222,6 +2570,7 @@ class MainWindow(QMainWindow):
         self._load_session_workspace(session)
         self.switch_page(0)
         self._refresh_session_list()
+        self.save_sessions()
         self.statusBar().showMessage("已创建新对话", 3000)
 
     def on_conversation_changed(self, first_user_text: str = "") -> None:
@@ -2233,6 +2582,7 @@ class MainWindow(QMainWindow):
             session["title"] = normalized[:22] + ("..." if len(normalized) > 22 else "")
             self.top_title.setText(session["title"])
         self._refresh_session_list()
+        self.save_sessions()
 
     def open_session(self, session_id: str) -> None:
         if session_id == self.active_session_id:
@@ -2250,6 +2600,7 @@ class MainWindow(QMainWindow):
         self.switch_page(0)
         self.top_title.setText(session["title"])
         self._refresh_session_list()
+        self.save_sessions()
 
     def delete_session(self, session_id: str) -> None:
         if self._workspace_busy():
@@ -2264,6 +2615,7 @@ class MainWindow(QMainWindow):
                 self.create_session()
                 return
         self._refresh_session_list()
+        self.save_sessions()
 
     def _refresh_session_list(self) -> None:
         while self.thread_list_layout.count():
@@ -2310,6 +2662,7 @@ class MainWindow(QMainWindow):
             or self.image_tab.preview_loading
             or not self.video_tab.submit_button.isEnabled()
             or self.video_tab.polling
+            or self.video_tab.uploading_images
         )
 
     def _find_session(self, session_id: str) -> Optional[Dict[str, Any]]:
@@ -2318,15 +2671,76 @@ class MainWindow(QMainWindow):
     def _active_session(self) -> Optional[Dict[str, Any]]:
         return self._find_session(self.active_session_id)
 
+    def data_dir_path(self) -> Path:
+        return normalize_data_dir(self.data_dir.text())
+
+    def sessions_path(self) -> Path:
+        return sessions_file_path(self.data_dir_path())
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._capture_active_workspace()
+        self.save_sessions()
         self.save_settings()
         super().closeEvent(event)
+
+    def load_sessions(self) -> None:
+        path = self.sessions_path()
+        legacy_path = legacy_app_data_dir() / "sessions.json"
+        if not path.exists() and legacy_path.exists():
+            path = legacy_path
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            self.warn(f"读取历史对话失败：{exc}")
+            return
+        sessions = payload.get("sessions", [])
+        if not isinstance(sessions, list):
+            return
+        normalized = []
+        for session in sessions:
+            if not isinstance(session, dict):
+                continue
+            session_id = str(session.get("id") or uuid.uuid4().hex)
+            normalized.append(
+                {
+                    "id": session_id,
+                    "title": str(session.get("title") or "新对话"),
+                    "messages": session.get("messages") if isinstance(session.get("messages"), list) else [],
+                    "image_state": session.get("image_state") if isinstance(session.get("image_state"), dict) else {},
+                    "video_state": session.get("video_state") if isinstance(session.get("video_state"), dict) else {},
+                }
+            )
+        self.sessions = normalized
+        self.active_session_id = str(payload.get("active_session_id") or "")
+
+    def save_sessions(self) -> None:
+        self._capture_active_workspace()
+        path = self.sessions_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                pretty_json(
+                    json_safe(
+                        {
+                            "version": 1,
+                            "active_session_id": self.active_session_id,
+                            "sessions": self.sessions,
+                        }
+                    )
+                ),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            self.warn(f"保存历史对话失败：{exc}")
 
     def save_settings(self) -> None:
         self.settings.setValue("base_url", self.base_url.text().strip() or DEFAULT_BASE_URL)
         self.settings.setValue("save_key", self.save_key.isChecked())
         self.settings.setValue("api_key", self.api_key.text().strip() if self.save_key.isChecked() else "")
+        self.settings.setValue("data_dir", str(self.data_dir_path()))
+        self.settings.setValue("image_upload_endpoint", self.image_upload_endpoint.text().strip() or DEFAULT_IMAGE_UPLOAD_ENDPOINT)
         self.settings.sync()
 
     def client(self) -> AgnesClient:
@@ -2392,6 +2806,19 @@ def run_self_test() -> None:
     video = build_video_payload("move", "keyframes", ["a", "b"], 1152, 768, 121, 24, None, 8, "")
     assert video["extra_body"]["mode"] == "keyframes"
     assert video["seed"] == 8
+    image_video = build_video_payload("move", "image", ["https://example.com/a.jpg"], 1152, 768, 121, 24, None, None, "")
+    assert image_video["image"] == "https://example.com/a.jpg"
+    assert "extra_body" not in image_video
+    assert is_null_pointer_endpoint("https://0x0.st/")
+    assert is_tmpfiles_endpoint("https://tmpfiles.org/api/v1/upload")
+    assert is_auto_upload_endpoint("auto")
+    assert tmpfiles_direct_url("https://tmpfiles.org/123/a.jpg") == "https://tmpfiles.org/dl/123/a.jpg"
+    assert append_urls("https://a.test/1.png\n", ["https://a.test/1.png", "https://a.test/2.png"]) == "https://a.test/1.png\nhttps://a.test/2.png"
+    json.dumps(json_safe({"image_state": {"current_bytes": b"preview"}}), ensure_ascii=False)
+    assert sessions_file_path(default_data_dir()).name == "sessions.json"
+    assert extract_video_url({"status": "completed", "video_url": "https://example.com/result.mp4"}) == "https://example.com/result.mp4"
+    assert extract_video_url({"data": [{"url": "https://example.com/nested/result.mp4"}]}) == "https://example.com/nested/result.mp4"
+    assert extract_video_url({"output": {"video": {"url": "https://storage.googleapis.com/bucket/object?token=1"}}}) == "https://storage.googleapis.com/bucket/object?token=1"
     try:
         validate_video_frames(120)
     except ValueError:
