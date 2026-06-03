@@ -1,3 +1,5 @@
 build/
 dist/
 **/__pycache__/
+agnes_data/
+project/

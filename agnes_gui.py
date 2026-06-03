@@ -71,12 +71,13 @@ VIDEO_CONTAINER_KEYS = (
     "content",
 )
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".webm", ".m3u8", ".avi", ".mkv")
+SCDN_UPLOAD_ENDPOINT = "https://img.scdn.io/api/v1.php"
 CATBOX_UPLOAD_ENDPOINT = "https://catbox.moe/user/api.php"
 NULL_POINTER_UPLOAD_ENDPOINT = "https://0x0.st"
 TMPFILES_UPLOAD_ENDPOINT = "https://tmpfiles.org/api/v1/upload"
 DEFAULT_IMAGE_UPLOAD_ENDPOINT = "auto"
-AUTO_IMAGE_UPLOAD_ENDPOINTS = (TMPFILES_UPLOAD_ENDPOINT, CATBOX_UPLOAD_ENDPOINT)
-IMAGE_UPLOAD_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
+AUTO_IMAGE_UPLOAD_ENDPOINTS = (SCDN_UPLOAD_ENDPOINT, CATBOX_UPLOAD_ENDPOINT, TMPFILES_UPLOAD_ENDPOINT)
+IMAGE_UPLOAD_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 
 
 def default_data_dir() -> Path:
@@ -500,6 +501,10 @@ def is_tmpfiles_endpoint(endpoint: str) -> bool:
     return endpoint.strip().rstrip("/").lower() == TMPFILES_UPLOAD_ENDPOINT
 
 
+def is_scdn_endpoint(endpoint: str) -> bool:
+    return endpoint.strip().rstrip("/").lower() == SCDN_UPLOAD_ENDPOINT
+
+
 def is_auto_upload_endpoint(endpoint: str) -> bool:
     cleaned = endpoint.strip().lower()
     return cleaned in {"", "auto", "自动"}
@@ -530,7 +535,14 @@ def upload_image_file(path: str, endpoint: str = DEFAULT_IMAGE_UPLOAD_ENDPOINT) 
 
     mime_type = mimetypes.guess_type(str(image_path))[0] or "application/octet-stream"
     with image_path.open("rb") as handle:
-        if is_tmpfiles_endpoint(endpoint):
+        if is_scdn_endpoint(endpoint):
+            response = requests.post(
+                endpoint,
+                data={"cdn_domain": "img.scdn.io", "outputFormat": "auto"},
+                files={"image": (image_path.name, handle, mime_type)},
+                timeout=120,
+            )
+        elif is_tmpfiles_endpoint(endpoint):
             response = requests.post(
                 endpoint,
                 data={"expire": "21600"},
@@ -552,7 +564,14 @@ def upload_image_file(path: str, endpoint: str = DEFAULT_IMAGE_UPLOAD_ENDPOINT) 
             )
     if not response.ok:
         raise RuntimeError(f"图床上传失败：HTTP {response.status_code} {response.text[:200]}")
-    if is_tmpfiles_endpoint(endpoint):
+    if is_scdn_endpoint(endpoint):
+        try:
+            payload = response.json()
+            url = str(payload.get("url") or payload.get("data", {}).get("url") or "")
+        except (ValueError, AttributeError):
+            url = ""
+        url = _clean_http_url(url)
+    elif is_tmpfiles_endpoint(endpoint):
         try:
             url = str(response.json().get("data", {}).get("url", ""))
         except (ValueError, AttributeError):
@@ -573,26 +592,16 @@ def upload_images_to_catbox(paths: List[str], endpoint: str = DEFAULT_IMAGE_UPLO
     return [upload_image_file(path, endpoint) for path in paths]
 
 
-def prepare_video_image(path: str, width: int, height: int, output_dir: Path) -> str:
+def prepare_video_image(path: str, output_dir: Path) -> str:
     source = Path(path)
     image = QImage(str(source))
     if image.isNull():
         raise ValueError(f"无法读取图片：{source}")
-    if width <= 0 or height <= 0:
-        raise ValueError("视频宽高必须大于 0。")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    scaled = image.convertToFormat(QImage.Format_RGB888).scaled(
-        width,
-        height,
-        Qt.KeepAspectRatioByExpanding,
-        Qt.SmoothTransformation,
-    )
-    left = max(0, (scaled.width() - width) // 2)
-    top = max(0, (scaled.height() - height) // 2)
-    cropped = scaled.copy(left, top, width, height)
-    output_path = output_dir / f"{source.stem}-{uuid.uuid4().hex[:8]}-{width}x{height}.jpg"
-    if not cropped.save(str(output_path), "JPEG", 92):
+    converted = image.convertToFormat(QImage.Format_RGB888)
+    output_path = output_dir / f"{source.stem}-{uuid.uuid4().hex[:8]}.jpg"
+    if not converted.save(str(output_path), "JPEG", 92):
         raise RuntimeError(f"图片转存失败：{output_path}")
     return str(output_path)
 
@@ -1612,7 +1621,7 @@ class SettingsTab(QWidget):
         data_note.setWordWrap(True)
         form.addRow("", data_note)
         form.addRow("图片上传接口", self.window.image_upload_endpoint)
-        upload_note = QLabel("用于“上传本地图片并回填 URL”。默认 auto：优先 tmpfiles.org 直链，失败后尝试 Catbox；也可填写 Catbox 兼容的 reqtype=fileupload/fileToUpload 自有图床接口。")
+        upload_note = QLabel("用于“上传本地图片并回填 URL”。默认 auto：优先 img.scdn.io，失败后尝试备用图床；也可填写自定义上传接口。")
         upload_note.setObjectName("muted")
         upload_note.setWordWrap(True)
         form.addRow("", upload_note)
@@ -1887,7 +1896,7 @@ class VideoTab(QWidget):
         self.upload_status = QLabel("本地图片会上传到第三方公开图床，获得公网 URL 后再提交给 Agnes。")
         self.upload_status.setObjectName("muted")
         self.upload_status.setWordWrap(True)
-        self.normalize_upload = QCheckBox("上传前转为视频尺寸 JPEG（兼容模式）")
+        self.normalize_upload = QCheckBox("失败时尝试：重新编码为 JPEG")
         self.normalize_upload.setChecked(False)
         self.negative_prompt = QLineEdit()
         self.negative_prompt.setPlaceholderText("可选：描述要避免的内容")
@@ -1996,13 +2005,13 @@ class VideoTab(QWidget):
         if self.normalize_upload.isChecked():
             try:
                 upload_paths = [
-                    prepare_video_image(path, self.width.value(), self.height.value(), self.window.data_dir_path() / "uploads")
+                    prepare_video_image(path, self.window.data_dir_path() / "uploads")
                     for path in paths
                 ]
             except (OSError, RuntimeError, ValueError) as exc:
                 self.window.warn(str(exc))
                 return
-            status_text = f"已转为 {self.width.value()}x{self.height.value()} JPEG，正在上传 {len(upload_paths)} 张图片..."
+            status_text = f"已重新编码为 JPEG，正在上传 {len(upload_paths)} 张图片..."
         else:
             upload_paths = paths
             status_text = f"正在上传 {len(upload_paths)} 张原图..."
@@ -2372,7 +2381,7 @@ class MainWindow(QMainWindow):
         self.data_dir = QLineEdit(str(normalize_data_dir(saved_data_dir)))
         self.data_dir.setPlaceholderText(str(default_data_dir()))
         saved_upload_endpoint = str(self.settings.value("image_upload_endpoint", "") or "").strip()
-        if saved_upload_endpoint in {CATBOX_UPLOAD_ENDPOINT, NULL_POINTER_UPLOAD_ENDPOINT}:
+        if saved_upload_endpoint in {CATBOX_UPLOAD_ENDPOINT, NULL_POINTER_UPLOAD_ENDPOINT, TMPFILES_UPLOAD_ENDPOINT}:
             saved_upload_endpoint = ""
         self.image_upload_endpoint = QLineEdit(saved_upload_endpoint or DEFAULT_IMAGE_UPLOAD_ENDPOINT)
 
@@ -2809,6 +2818,8 @@ def run_self_test() -> None:
     image_video = build_video_payload("move", "image", ["https://example.com/a.jpg"], 1152, 768, 121, 24, None, None, "")
     assert image_video["image"] == "https://example.com/a.jpg"
     assert "extra_body" not in image_video
+    assert AUTO_IMAGE_UPLOAD_ENDPOINTS[0] == SCDN_UPLOAD_ENDPOINT
+    assert is_scdn_endpoint("https://img.scdn.io/api/v1.php")
     assert is_null_pointer_endpoint("https://0x0.st/")
     assert is_tmpfiles_endpoint("https://tmpfiles.org/api/v1/upload")
     assert is_auto_upload_endpoint("auto")
