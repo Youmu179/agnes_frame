@@ -44,6 +44,10 @@ from PyQt5.QtWidgets import (
 APP_NAME = "Agnes Agent"
 DEFAULT_BASE_URL = "https://apihub.agnes-ai.com"
 TEXT_MODEL = "agnes-2.0-flash"
+TEXT_CONTEXT_WINDOW = 256000
+TEXT_MAX_OUTPUT_TOKENS = 65500
+DEFAULT_CONTEXT_COMPRESS_THRESHOLD = 90
+DEFAULT_RECENT_CONTEXT_MESSAGES = 24
 IMAGE_MODEL_21 = "agnes-image-2.1-flash"
 IMAGE_MODEL_20 = "agnes-image-2.0-flash"
 IMAGE_MODEL = IMAGE_MODEL_21
@@ -616,6 +620,73 @@ def optional_int(value: int, enabled: bool) -> Optional[int]:
     return value if enabled else None
 
 
+def extract_usage(payload: Dict[str, Any]) -> Dict[str, Any]:
+    usage = payload.get("usage")
+    return usage if isinstance(usage, dict) else {}
+
+
+def estimate_text_tokens(text: Any) -> int:
+    total = 0.0
+    for char in str(text or ""):
+        code = ord(char)
+        if "\u4e00" <= char <= "\u9fff" or "\u3040" <= char <= "\u30ff" or "\uac00" <= char <= "\ud7af":
+            total += 1.0
+        elif char.isspace():
+            total += 0.25
+        elif code < 128:
+            total += 0.25
+        else:
+            total += 0.8
+    return max(1, int(total) + 1) if text else 0
+
+
+def message_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(str(item.get("text") or ""))
+                elif item.get("type") == "image_url":
+                    image_url = item.get("image_url") or {}
+                    parts.append(str(image_url.get("url") or ""))
+            else:
+                parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+    return str(content or "")
+
+
+def estimate_messages_tokens(messages: List[Dict[str, Any]]) -> int:
+    total = 0
+    for message in messages:
+        total += 6
+        total += estimate_text_tokens(message.get("role", ""))
+        total += estimate_text_tokens(message_content_text(message.get("content", "")))
+    return total + 8
+
+
+def format_token_count(value: Any) -> str:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return "0"
+    if number >= 1000:
+        return f"{number:,}"
+    return str(number)
+
+
+def conversation_to_text(messages: List[Dict[str, Any]]) -> str:
+    parts = []
+    for index, message in enumerate(messages, 1):
+        role = str(message.get("role") or "unknown")
+        content = message_content_text(message.get("content", ""))
+        if content:
+            parts.append(f"[{index}] {role}:\n{content}")
+    return "\n\n".join(parts)
+
+
 def extract_chat_content(payload: Dict[str, Any]) -> str:
     choices = payload.get("choices") or []
     if not choices:
@@ -834,6 +905,7 @@ class AgnesClient:
         chunks: List[str] = []
         reasoning_chunks: List[str] = []
         events: List[Dict[str, Any]] = []
+        usage: Dict[str, Any] = {}
         for raw_line in response.iter_lines(decode_unicode=False):
             if not raw_line:
                 continue
@@ -849,6 +921,9 @@ class AgnesClient:
                 events.append({"raw": data})
                 continue
             events.append(event)
+            event_usage = extract_usage(event)
+            if event_usage:
+                usage = event_usage
             choices = event.get("choices") or []
             if not choices:
                 continue
@@ -867,6 +942,7 @@ class AgnesClient:
             "stream": True,
             "content": "".join(chunks),
             "reasoning": "".join(reasoning_chunks),
+            "usage": usage,
             "events": events,
         }
 
@@ -1296,8 +1372,14 @@ class TextTab(QWidget):
     def __init__(self, window: "MainWindow"):
         super().__init__()
         self.window = window
-        self.messages: List[Dict[str, str]] = []
+        self.messages: List[Dict[str, Any]] = []
         self.streaming_text = ""
+        self.streaming_reasoning = ""
+        self.context_summary = ""
+        self.summary_message_count = 0
+        self.last_usage: Dict[str, Any] = {}
+        self.last_context_estimate: Dict[str, Any] = {}
+        self.last_compression_notice = ""
 
         self.answer = QTextBrowser()
         self.answer.setOpenExternalLinks(True)
@@ -1336,10 +1418,22 @@ class TextTab(QWidget):
         self.top_p.setSingleStep(0.05)
         self.top_p.setValue(1.0)
         self.max_tokens = QSpinBox()
-        self.max_tokens.setRange(1, 65500)
+        self.max_tokens.setRange(1, TEXT_MAX_OUTPUT_TOKENS)
         self.max_tokens.setValue(1024)
         self.stream = QCheckBox("流式输出")
         self.stream.setChecked(True)
+        self.thinking_mode = QComboBox()
+        self.thinking_mode.addItem("自动", "auto")
+        self.thinking_mode.addItem("开启", "on")
+        self.thinking_mode.addItem("关闭", "off")
+        self.auto_compress = QCheckBox("上下文接近上限时自动压缩")
+        self.auto_compress.setChecked(True)
+        self.compress_threshold = QSpinBox()
+        self.compress_threshold.setRange(50, 99)
+        self.compress_threshold.setValue(DEFAULT_CONTEXT_COMPRESS_THRESHOLD)
+        self.recent_context_messages = QSpinBox()
+        self.recent_context_messages.setRange(4, 80)
+        self.recent_context_messages.setValue(DEFAULT_RECENT_CONTEXT_MESSAGES)
         self.raw = QTextEdit()
         self.raw.setReadOnly(True)
 
@@ -1351,6 +1445,9 @@ class TextTab(QWidget):
         self.settings_button = QPushButton("⚙  模型设置")
         self.settings_button.setObjectName("subtleButton")
         self.settings_button.setCheckable(True)
+        self.context_button = QPushButton("上下文")
+        self.context_button.setObjectName("subtleButton")
+        self.context_button.setCheckable(True)
         self.debug_button = QPushButton("查看原始响应")
         self.debug_button.setObjectName("subtleButton")
         self.debug_button.setCheckable(True)
@@ -1363,6 +1460,7 @@ class TextTab(QWidget):
         composer_layout.addWidget(self.user_prompt)
         composer_actions = QHBoxLayout()
         composer_actions.addWidget(self.settings_button)
+        composer_actions.addWidget(self.context_button)
         composer_actions.addWidget(self.debug_button)
         composer_actions.addStretch()
         composer_actions.addWidget(QLabel(TEXT_MODEL))
@@ -1384,7 +1482,30 @@ class TextTab(QWidget):
         params.addWidget(self.stream)
         params.addStretch()
         settings_layout.addRow("生成参数", params)
+        thinking_row = QHBoxLayout()
+        thinking_row.addWidget(QLabel("Thinking"))
+        thinking_row.addWidget(self.thinking_mode)
+        thinking_row.addStretch()
+        settings_layout.addRow("思考模式", thinking_row)
+        compress_row = QHBoxLayout()
+        compress_row.addWidget(self.auto_compress)
+        compress_row.addWidget(QLabel("阈值"))
+        compress_row.addWidget(self.compress_threshold)
+        compress_row.addWidget(QLabel("%"))
+        compress_row.addWidget(QLabel("保留最近消息"))
+        compress_row.addWidget(self.recent_context_messages)
+        compress_row.addStretch()
+        settings_layout.addRow("上下文", compress_row)
         self.settings_panel.hide()
+
+        self.context_panel = QFrame()
+        self.context_panel.setObjectName("settingsPanel")
+        context_layout = QVBoxLayout(self.context_panel)
+        context_layout.setContentsMargins(10, 10, 10, 10)
+        self.context_view = QTextBrowser()
+        self.context_view.setMaximumHeight(220)
+        context_layout.addWidget(self.context_view)
+        self.context_panel.hide()
 
         self.raw_panel = QFrame()
         self.raw_panel.setObjectName("settingsPanel")
@@ -1399,13 +1520,22 @@ class TextTab(QWidget):
         layout.addWidget(self.thinking_panel)
         layout.addWidget(self.answer, 1)
         layout.addWidget(self.settings_panel)
+        layout.addWidget(self.context_panel)
         layout.addWidget(self.raw_panel)
         layout.addWidget(composer)
 
         self.send_button.clicked.connect(self.send)
         self.clear_button.clicked.connect(self.window.new_chat)
         self.settings_button.toggled.connect(self.settings_panel.setVisible)
+        self.context_button.toggled.connect(self.context_panel.setVisible)
         self.debug_button.toggled.connect(self.raw_panel.setVisible)
+        self.user_prompt.textChanged.connect(self._update_context_panel)
+        self.max_tokens.valueChanged.connect(lambda _value: self._update_context_panel())
+        self.compress_threshold.valueChanged.connect(lambda _value: self._update_context_panel())
+        self.recent_context_messages.valueChanged.connect(lambda _value: self._update_context_panel())
+        self.auto_compress.toggled.connect(lambda _checked: self._update_context_panel())
+        self.thinking_mode.currentIndexChanged.connect(lambda _index: self._update_context_panel())
+        self._update_context_panel()
 
     def _show_welcome(self) -> None:
         self.answer.setHtml(self._welcome_html())
@@ -1427,12 +1557,32 @@ class TextTab(QWidget):
             </div>
             """
 
-    def load_messages(self, messages: List[Dict[str, str]]) -> None:
+    def load_session_state(self, session: Dict[str, Any]) -> None:
+        self.context_summary = str(session.get("context_summary") or "")
+        self.summary_message_count = int(session.get("summary_message_count") or 0)
+        self.last_usage = session.get("last_usage") if isinstance(session.get("last_usage"), dict) else {}
+        self.last_context_estimate = (
+            session.get("last_context_estimate") if isinstance(session.get("last_context_estimate"), dict) else {}
+        )
+        self.last_compression_notice = str(session.get("last_compression_notice") or "")
+        self.load_messages(session.setdefault("messages", []))
+
+    def load_messages(self, messages: List[Dict[str, Any]]) -> None:
         self.messages = messages
         self.streaming_text = ""
         self.streaming_reasoning = ""
         self.raw.clear()
         self._render_conversation()
+        self._update_context_panel()
+
+    def export_context_state(self) -> Dict[str, Any]:
+        return {
+            "context_summary": self.context_summary,
+            "summary_message_count": self.summary_message_count,
+            "last_usage": self.last_usage,
+            "last_context_estimate": self.last_context_estimate,
+            "last_compression_notice": self.last_compression_notice,
+        }
 
     def _render_conversation(self, error: str = "") -> None:
         if not self.messages and not self.streaming_text and not error:
@@ -1485,7 +1635,261 @@ class TextTab(QWidget):
             self.thinking_toggle.setText("▸ 已完成思考")
             self.thinking_toggle.setChecked(False)
 
+    def _build_request_messages(
+        self,
+        history: List[Dict[str, Any]],
+        user_text: str,
+        system_prompt: str,
+        context_summary: str,
+        summary_message_count: int,
+    ) -> List[Dict[str, str]]:
+        request_messages: List[Dict[str, str]] = []
+        if system_prompt.strip():
+            request_messages.append({"role": "system", "content": system_prompt.strip()})
+        if context_summary.strip():
+            request_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "以下是本会话早期上下文的压缩摘要。请把它作为长期记忆使用，但优先遵循用户的最新消息。\n\n"
+                        + context_summary.strip()
+                    ),
+                }
+            )
+        start = max(0, min(summary_message_count, len(history)))
+        request_messages.extend(
+            {"role": str(message.get("role") or "user"), "content": message_content_text(message.get("content", ""))}
+            for message in history[start:]
+            if message.get("role") in {"user", "assistant", "system"}
+        )
+        request_messages.append({"role": "user", "content": user_text})
+        return request_messages
+
+    def _should_enable_thinking(self, user_text: str, mode: Optional[str] = None) -> bool:
+        mode = str(mode or self.thinking_mode.currentData() or "auto")
+        if mode == "on":
+            return True
+        if mode == "off":
+            return False
+        keywords = (
+            "代码",
+            "编程",
+            "调试",
+            "报错",
+            "错误",
+            "分析",
+            "推理",
+            "规划",
+            "计划",
+            "方案",
+            "重构",
+            "实现",
+            "agent",
+            "debug",
+            "code",
+            "reason",
+            "analyze",
+            "plan",
+            "implement",
+            "refactor",
+        )
+        lowered = user_text.lower()
+        return any(keyword in lowered for keyword in keywords)
+
+    def _context_estimate(
+        self,
+        request_messages: List[Dict[str, Any]],
+        max_tokens: Optional[int] = None,
+        threshold: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        prompt_tokens = estimate_messages_tokens(request_messages)
+        reserved_output = int(max_tokens if max_tokens is not None else self.max_tokens.value())
+        total = prompt_tokens + reserved_output
+        percent = int(total * 100 / TEXT_CONTEXT_WINDOW)
+        return {
+            "prompt_tokens_estimate": prompt_tokens,
+            "reserved_output_tokens": reserved_output,
+            "total_tokens_estimate": total,
+            "context_window": TEXT_CONTEXT_WINDOW,
+            "percent": percent,
+            "threshold": int(threshold if threshold is not None else self.compress_threshold.value()),
+        }
+
+    def _current_request_preview(self) -> List[Dict[str, str]]:
+        return self._build_request_messages(
+            self.messages,
+            self.user_prompt.toPlainText().strip(),
+            self.system_prompt.toPlainText(),
+            self.context_summary,
+            self.summary_message_count,
+        )
+
+    def _update_context_panel(self) -> None:
+        request_messages = self._current_request_preview()
+        estimate = self._context_estimate(request_messages)
+        prompt_estimate = estimate["prompt_tokens_estimate"]
+        total_estimate = estimate["total_tokens_estimate"]
+        percent = estimate["percent"]
+        self.context_button.setText(
+            f"上下文 {format_token_count(total_estimate)} / {format_token_count(TEXT_CONTEXT_WINDOW)}"
+        )
+        usage_html = "暂无服务端 usage。发送一次消息后会显示实际 token。"
+        if self.last_usage:
+            usage_html = (
+                f"上次实际输入：{format_token_count(self.last_usage.get('prompt_tokens'))} tokens<br>"
+                f"上次实际输出：{format_token_count(self.last_usage.get('completion_tokens'))} tokens<br>"
+                f"上次总量：{format_token_count(self.last_usage.get('total_tokens'))} tokens"
+            )
+        summary_preview = self._html(self.context_summary[:1200]) if self.context_summary else "暂无压缩摘要。"
+        thinking_label = self.thinking_mode.currentText()
+        notice = self._html(self.last_compression_notice) if self.last_compression_notice else "暂无自动压缩记录。"
+        recent_start = max(0, min(self.summary_message_count, len(self.messages)))
+        html = f"""
+        <div style="color:#d7d7d7; line-height:1.65;">
+          <b>当前上下文</b><br>
+          估算输入：{format_token_count(prompt_estimate)} tokens<br>
+          预留输出：{format_token_count(self.max_tokens.value())} tokens<br>
+          估算总量：{format_token_count(total_estimate)} / {format_token_count(TEXT_CONTEXT_WINDOW)} tokens（约 {percent}%）<br>
+          自动压缩：{"开启" if self.auto_compress.isChecked() else "关闭"}，阈值 {self.compress_threshold.value()}%<br>
+          Thinking：{self._html(thinking_label)}<br>
+          最近发送上下文：{len(self.messages) - recent_start} 条消息，已摘要覆盖：{self.summary_message_count} 条消息
+          <hr>
+          <b>服务端 usage</b><br>{usage_html}
+          <hr>
+          <b>压缩状态</b><br>{notice}
+          <hr>
+          <b>长期摘要预览</b><br>
+          <pre style="white-space:pre-wrap; color:#bdbdbd;">{summary_preview}</pre>
+        </div>
+        """
+        self.context_view.setHtml(html)
+
+    def _build_chat_payload(self, request_messages: List[Dict[str, str]], user_text: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "model": TEXT_MODEL,
+            "messages": request_messages,
+            "temperature": settings["temperature"],
+            "top_p": settings["top_p"],
+            "max_tokens": settings["max_tokens"],
+            "stream": settings["stream"],
+        }
+        if self._should_enable_thinking(user_text, settings["thinking_mode"]):
+            payload["chat_template_kwargs"] = {"enable_thinking": True}
+        return payload
+
+    def _compress_context_if_needed(
+        self,
+        client: AgnesClient,
+        history: List[Dict[str, Any]],
+        user_text: str,
+        system_prompt: str,
+        context_summary: str,
+        summary_message_count: int,
+        settings: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        request_messages = self._build_request_messages(history, user_text, system_prompt, context_summary, summary_message_count)
+        estimate = self._context_estimate(request_messages, settings["max_tokens"], settings["compress_threshold"])
+        threshold = settings["compress_threshold"]
+        if not settings["auto_compress"] or estimate["percent"] < threshold:
+            return {
+                "request_messages": request_messages,
+                "context_summary": context_summary,
+                "summary_message_count": summary_message_count,
+                "compressed": False,
+                "compression_usage": {},
+                "context_estimate": estimate,
+            }
+
+        recent_count = max(4, settings["recent_context_messages"])
+        target_count = max(summary_message_count, len(history) - recent_count)
+        if target_count <= summary_message_count:
+            return {
+                "request_messages": request_messages,
+                "context_summary": context_summary,
+                "summary_message_count": summary_message_count,
+                "compressed": False,
+                "compression_usage": {},
+                "context_estimate": estimate,
+            }
+
+        messages_to_summarize = history[summary_message_count:target_count]
+        compression_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a context compression assistant for an AI IDE chat. "
+                    "Create a compact Chinese summary that preserves user goals, decisions, constraints, file paths, "
+                    "URLs, API details, errors, pending tasks, and important preferences. Do not include private API keys. "
+                    "Do not mention irrelevant small talk. Return only the updated summary."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "已有长期摘要：\n"
+                    f"{context_summary or '（无）'}\n\n"
+                    "请把下面这些较早对话并入长期摘要：\n"
+                    f"{conversation_to_text(messages_to_summarize)}"
+                ),
+            },
+        ]
+        compression_payload = {
+            "model": TEXT_MODEL,
+            "messages": compression_messages,
+            "temperature": 0.2,
+            "max_tokens": 4096,
+            "stream": False,
+        }
+        compression_result = client.chat(compression_payload, None)
+        new_summary = extract_chat_content(compression_result).strip()
+        if not new_summary:
+            raise RuntimeError("自动压缩上下文失败：模型没有返回摘要。")
+        request_messages = self._build_request_messages(history, user_text, system_prompt, new_summary, target_count)
+        estimate = self._context_estimate(request_messages, settings["max_tokens"], settings["compress_threshold"])
+        if estimate["total_tokens_estimate"] >= TEXT_CONTEXT_WINDOW:
+            raise RuntimeError("当前输入过大，压缩历史后仍可能超过 256K 上下文。请缩短本次输入后重试。")
+        return {
+            "request_messages": request_messages,
+            "context_summary": new_summary,
+            "summary_message_count": target_count,
+            "compressed": True,
+            "compression_usage": extract_usage(compression_result),
+            "context_estimate": estimate,
+        }
+
+    def _run_chat_job(
+        self,
+        client: AgnesClient,
+        history: List[Dict[str, Any]],
+        user_text: str,
+        system_prompt: str,
+        context_summary: str,
+        summary_message_count: int,
+        settings: Dict[str, Any],
+        on_chunk: Optional[Callable[[str, str], None]],
+    ) -> Dict[str, Any]:
+        context_state = self._compress_context_if_needed(
+            client,
+            history,
+            user_text,
+            system_prompt,
+            context_summary,
+            summary_message_count,
+            settings,
+        )
+        payload = self._build_chat_payload(context_state["request_messages"], user_text, settings)
+        chat_result = client.chat(payload, on_chunk)
+        return {
+            "chat_result": chat_result,
+            **context_state,
+        }
+
     def clear(self) -> None:
+        self.context_summary = ""
+        self.summary_message_count = 0
+        self.last_usage = {}
+        self.last_context_estimate = {}
+        self.last_compression_notice = ""
         self.load_messages([])
         self.window.statusBar().showMessage("已创建新对话")
 
@@ -1501,22 +1905,27 @@ class TextTab(QWidget):
         except ValueError as exc:
             self.window.warn(str(exc))
             return
-        request_messages: List[Dict[str, str]] = []
-        if self.system_prompt.toPlainText().strip():
-            request_messages.append({"role": "system", "content": self.system_prompt.toPlainText().strip()})
-        request_messages.extend(
-            {"role": message["role"], "content": message.get("content", "")}
-            for message in self.messages
-        )
-        request_messages.append({"role": "user", "content": user_text})
-        payload = {
-            "model": TEXT_MODEL,
-            "messages": request_messages,
+        history = [dict(message) for message in self.messages]
+        settings = {
             "temperature": self.temperature.value(),
             "top_p": self.top_p.value(),
             "max_tokens": self.max_tokens.value(),
             "stream": self.stream.isChecked(),
+            "thinking_mode": str(self.thinking_mode.currentData() or "auto"),
+            "auto_compress": self.auto_compress.isChecked(),
+            "compress_threshold": self.compress_threshold.value(),
+            "recent_context_messages": self.recent_context_messages.value(),
         }
+        system_prompt = self.system_prompt.toPlainText()
+        context_summary = self.context_summary
+        summary_message_count = self.summary_message_count
+        preview_messages = self._build_request_messages(history, user_text, system_prompt, context_summary, summary_message_count)
+        preview_estimate = self._context_estimate(preview_messages, settings["max_tokens"], settings["compress_threshold"])
+        if preview_estimate["total_tokens_estimate"] >= TEXT_CONTEXT_WINDOW and not settings["auto_compress"]:
+            self.window.warn("当前上下文可能超过 256K，请开启自动压缩或缩短历史。")
+            return
+        if settings["auto_compress"] and preview_estimate["percent"] >= settings["compress_threshold"]:
+            self.window.statusBar().showMessage("上下文接近上限，正在自动压缩后继续发送...")
         self.messages.append({"role": "user", "content": user_text})
         self.window.on_conversation_changed(user_text)
         self._render_conversation()
@@ -1525,9 +1934,18 @@ class TextTab(QWidget):
         self.streaming_text = ""
         self.streaming_reasoning = ""
         self.send_button.setEnabled(False)
-        on_chunk = self._on_stream_chunk if self.stream.isChecked() else None
+        on_chunk = self._on_stream_chunk if settings["stream"] else None
         self.window.start_job(
-            lambda: client.chat(payload, on_chunk),
+            lambda: self._run_chat_job(
+                client,
+                history,
+                user_text,
+                system_prompt,
+                context_summary,
+                summary_message_count,
+                settings,
+                on_chunk,
+            ),
             self._on_result,
             self._on_error,
             on_chunk_signal=self._append_stream_chunk if on_chunk else None,
@@ -1545,29 +1963,49 @@ class TextTab(QWidget):
         self._render_conversation()
 
     def _on_result(self, result: Dict[str, Any]) -> None:
-        self.raw.setPlainText(pretty_json(result))
-        if result.get("stream"):
-            content = result.get("content", "")
-            reasoning = result.get("reasoning", "")
+        chat_result = result.get("chat_result") if isinstance(result.get("chat_result"), dict) else result
+        if result.get("compressed"):
+            self.context_summary = str(result.get("context_summary") or "")
+            self.summary_message_count = int(result.get("summary_message_count") or self.summary_message_count)
+            self.last_compression_notice = (
+                f"已自动压缩早期上下文，摘要覆盖前 {self.summary_message_count} 条消息。"
+            )
+            self.window.statusBar().showMessage(self.last_compression_notice, 6000)
         else:
-            content = extract_chat_content(result)
-            reasoning = extract_chat_reasoning(result)
+            self.context_summary = str(result.get("context_summary") or self.context_summary)
+            self.summary_message_count = int(result.get("summary_message_count") or self.summary_message_count)
+        self.last_context_estimate = result.get("context_estimate") if isinstance(result.get("context_estimate"), dict) else {}
+        usage = extract_usage(chat_result)
+        self.last_usage = usage
+        self.raw.setPlainText(pretty_json(result))
+        if chat_result.get("stream"):
+            content = chat_result.get("content", "")
+            reasoning = chat_result.get("reasoning", "")
+        else:
+            content = extract_chat_content(chat_result)
+            reasoning = extract_chat_reasoning(chat_result)
         self.streaming_text = ""
         self.streaming_reasoning = ""
-        self.messages.append({"role": "assistant", "content": content, "reasoning": reasoning})
+        assistant_message: Dict[str, Any] = {"role": "assistant", "content": content, "reasoning": reasoning}
+        if usage:
+            assistant_message["usage"] = usage
+        self.messages.append(assistant_message)
         self.window.on_conversation_changed()
         self._render_conversation()
+        self._update_context_panel()
 
     def _send_finished(self) -> None:
         self.send_button.setEnabled(True)
         self.user_prompt.setEnabled(True)
         self.user_prompt.setFocus()
+        self._update_context_panel()
 
     def _on_error(self, message: str) -> None:
         self.raw.setPlainText(message)
         self.streaming_text = ""
         self.streaming_reasoning = ""
         self._render_conversation(error=message)
+        self._update_context_panel()
         self.window.warn(message)
 
     @staticmethod
@@ -2593,6 +3031,11 @@ class MainWindow(QMainWindow):
             "id": uuid.uuid4().hex,
             "title": "新对话",
             "messages": [],
+            "context_summary": "",
+            "summary_message_count": 0,
+            "last_usage": {},
+            "last_context_estimate": {},
+            "last_compression_notice": "",
             "image_state": {},
             "video_state": {},
         }
@@ -2678,11 +3121,12 @@ class MainWindow(QMainWindow):
         if not session:
             return
         session["messages"] = self.text_tab.messages
+        session.update(self.text_tab.export_context_state())
         session["image_state"] = self.image_tab.export_state()
         session["video_state"] = self.video_tab.export_state()
 
     def _load_session_workspace(self, session: Dict[str, Any]) -> None:
-        self.text_tab.load_messages(session.setdefault("messages", []))
+        self.text_tab.load_session_state(session)
         self.image_tab.load_state(session.setdefault("image_state", {}))
         self.video_tab.load_state(session.setdefault("video_state", {}))
 
@@ -2739,6 +3183,15 @@ class MainWindow(QMainWindow):
                     "id": session_id,
                     "title": str(session.get("title") or "新对话"),
                     "messages": session.get("messages") if isinstance(session.get("messages"), list) else [],
+                    "context_summary": str(session.get("context_summary") or ""),
+                    "summary_message_count": int(session.get("summary_message_count") or 0),
+                    "last_usage": session.get("last_usage") if isinstance(session.get("last_usage"), dict) else {},
+                    "last_context_estimate": (
+                        session.get("last_context_estimate")
+                        if isinstance(session.get("last_context_estimate"), dict)
+                        else {}
+                    ),
+                    "last_compression_notice": str(session.get("last_compression_notice") or ""),
                     "image_state": session.get("image_state") if isinstance(session.get("image_state"), dict) else {},
                     "video_state": session.get("video_state") if isinstance(session.get("video_state"), dict) else {},
                 }
@@ -2841,6 +3294,10 @@ def run_self_test() -> None:
     image_video = build_video_payload("move", "image", ["https://example.com/a.jpg"], 1152, 768, 121, 24, None, None, "")
     assert image_video["image"] == "https://example.com/a.jpg"
     assert "extra_body" not in image_video
+    assert extract_usage({"usage": {"prompt_tokens": 2}})["prompt_tokens"] == 2
+    assert estimate_text_tokens("你好") >= 2
+    assert estimate_messages_tokens([{"role": "user", "content": "hello"}]) > 0
+    assert "user" in conversation_to_text([{"role": "user", "content": "hello"}])
     assert AUTO_IMAGE_UPLOAD_ENDPOINTS[0] == SCDN_UPLOAD_ENDPOINT
     assert is_scdn_endpoint("https://img.scdn.io/api/v1.php")
     assert is_null_pointer_endpoint("https://0x0.st/")
@@ -2883,6 +3340,7 @@ def run_self_test() -> None:
         requests.post = original_post
     assert streamed["content"] == "你好，世界"
     assert streamed["reasoning"] == "先判断，"
+    assert streamed["usage"]["total_tokens"] == 3
     assert streamed_chunks == [("reasoning", "先判断，"), ("content", "你好，世界")]
     assert extract_chat_content({"choices": []}) == ""
     assert extract_chat_content({"choices": [{"message": {"content": "ok"}}]}) == "ok"

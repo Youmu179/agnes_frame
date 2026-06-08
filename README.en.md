@@ -8,7 +8,7 @@ An unofficial desktop shell for testing Agnes free models from a simple Agent-st
 
 ## Features
 
-- Chat Agent: `agnes-2.0-flash`, multi-turn chat, streaming output, optional Thinking / Reasoning panel.
+- Chat Agent: `agnes-2.0-flash`, multi-turn chat, streaming output, optional Thinking / Reasoning panel, context usage view, and 90% threshold auto-compression.
 - Image Studio: defaults to the free `agnes-image-2.1-flash`, with `agnes-image-2.0-flash` still selectable; text-to-image, URL image editing, multi-image composition, preview and save.
 - Video Studio: `agnes-video-v2.0`, text-to-video, image-to-video, multi-image video, keyframe animation, async polling.
 

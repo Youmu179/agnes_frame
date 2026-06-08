@@ -8,7 +8,7 @@ English version: [README.en.md](README.en.md)
 
 ## 能做什么
 
-- 对话 Agent：调用 `agnes-2.0-flash`，支持多轮对话、流式输出、Thinking / Reasoning 折叠展示。
+- 对话 Agent：调用 `agnes-2.0-flash`，支持多轮对话、流式输出、Thinking / Reasoning 折叠展示、上下文 usage 查看和 90% 阈值自动压缩。
 - 图像工作室：默认调用免费的 `agnes-image-2.1-flash`，也可切换 `agnes-image-2.0-flash`；支持文生图、URL 图生图、多图合成、预览和保存。
 - 视频工作室：调用 `agnes-video-v2.0`，支持文生视频、图生视频、多图视频、关键帧动画、任务轮询。
 
