@@ -44,7 +44,13 @@ from PyQt5.QtWidgets import (
 APP_NAME = "Agnes Agent"
 DEFAULT_BASE_URL = "https://apihub.agnes-ai.com"
 TEXT_MODEL = "agnes-2.0-flash"
-IMAGE_MODEL = "agnes-image-2.0-flash"
+IMAGE_MODEL_21 = "agnes-image-2.1-flash"
+IMAGE_MODEL_20 = "agnes-image-2.0-flash"
+IMAGE_MODEL = IMAGE_MODEL_21
+IMAGE_MODEL_OPTIONS = (
+    ("Agnes Image 2.1 Flash（默认，免费）", IMAGE_MODEL_21),
+    ("Agnes Image 2.0 Flash", IMAGE_MODEL_20),
+)
 VIDEO_MODEL = "agnes-video-v2.0"
 HTTP_URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 VIDEO_URL_KEYS = (
@@ -719,16 +725,15 @@ class ComposerTextEdit(QTextEdit):
         super().keyPressEvent(event)
 
 
-def build_image_payload(prompt: str, size: str, seed: Optional[int], image_urls: List[str]) -> Dict[str, Any]:
+def build_image_payload(model: str, prompt: str, size: str, seed: Optional[int], image_urls: List[str]) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
-        "model": IMAGE_MODEL,
+        "model": model or IMAGE_MODEL,
         "prompt": prompt.strip(),
         "size": size,
     }
     if seed is not None:
         payload["seed"] = seed
     if image_urls:
-        payload["tags"] = ["img2img"]
         payload["extra_body"] = {"image": image_urls, "response_format": "url"}
     else:
         payload["extra_body"] = {"response_format": "url"}
@@ -1693,13 +1698,16 @@ class ImageTab(QWidget):
         self.prompt = QTextEdit()
         self.prompt.setPlaceholderText("描述要生成或编辑的图像。编辑时请写清楚要改变和保持不变的内容。")
         self.prompt.setMinimumHeight(100)
+        self.model = QComboBox()
+        for label, value in IMAGE_MODEL_OPTIONS:
+            self.model.addItem(label, value)
         self.size = QComboBox()
         self.size.addItems(["1024x1024", "1024x768", "768x1024"])
         self.seed_enabled = QCheckBox("指定 Seed")
         self.seed = QSpinBox()
         self.seed.setRange(0, 2147483647)
         self.input_urls = QTextEdit()
-        self.input_urls.setPlaceholderText("可选，每行一个公开可访问的图片 URL。填写后自动启用 img2img，多行可用于合成。")
+        self.input_urls.setPlaceholderText("可选，每行一个图片 URL 或 Data URI Base64。填写后自动启用 img2img，多行可用于合成。")
         self.input_urls.setFixedHeight(88)
         self.generate_button = QPushButton("生成图像")
         self.generate_button.setObjectName("primaryButton")
@@ -1720,7 +1728,7 @@ class ImageTab(QWidget):
         scroll.setWidget(self.preview)
 
         form = QFormLayout()
-        form.addRow("模型", QLabel(IMAGE_MODEL))
+        form.addRow("模型", self.model)
         form.addRow("Prompt", self.prompt)
         form.addRow("尺寸", self.size)
         seed_line = QHBoxLayout()
@@ -1756,6 +1764,7 @@ class ImageTab(QWidget):
         self.generate_button.clicked.connect(self.generate)
         self.open_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self.current_url)))
         self.save_button.clicked.connect(self.save_preview)
+        self.model.currentIndexChanged.connect(self._model_changed)
 
     @staticmethod
     def _boxed(title: str, widget: QWidget) -> QGroupBox:
@@ -1766,6 +1775,7 @@ class ImageTab(QWidget):
 
     def export_state(self) -> Dict[str, Any]:
         return {
+            "model": self.current_model(),
             "prompt": self.prompt.toPlainText(),
             "size": self.size.currentText(),
             "seed_enabled": self.seed_enabled.isChecked(),
@@ -1776,6 +1786,9 @@ class ImageTab(QWidget):
         }
 
     def load_state(self, state: Dict[str, Any]) -> None:
+        model = str(state.get("model", IMAGE_MODEL))
+        index = self.model.findData(model)
+        self.model.setCurrentIndex(index if index >= 0 else 0)
         self.prompt.setPlainText(str(state.get("prompt", "")))
         self.size.setCurrentText(str(state.get("size", "1024x1024")))
         self.seed_enabled.setChecked(bool(state.get("seed_enabled", False)))
@@ -1794,6 +1807,13 @@ class ImageTab(QWidget):
         else:
             self.preview.setText("生成结果将在这里预览")
 
+    def current_model(self) -> str:
+        return str(self.model.currentData() or IMAGE_MODEL)
+
+    def _model_changed(self) -> None:
+        if getattr(self.window, "stack", None) is not None and self.window.stack.currentIndex() == 1:
+            self.window.model_label.setText(self.current_model())
+
     def generate(self) -> None:
         if not self.prompt.toPlainText().strip():
             self.window.warn("请输入图像 Prompt。")
@@ -1804,6 +1824,7 @@ class ImageTab(QWidget):
             self.window.warn(str(exc))
             return
         payload = build_image_payload(
+            self.current_model(),
             self.prompt.toPlainText(),
             self.size.currentText(),
             optional_int(self.seed.value(), self.seed_enabled.isChecked()),
@@ -2548,7 +2569,8 @@ class MainWindow(QMainWindow):
 
     def switch_page(self, index: int) -> None:
         labels = ("生成 Agnes 模型测试 GUI", "图像工作室", "视频工作室", "设置")
-        models = (TEXT_MODEL, IMAGE_MODEL, VIDEO_MODEL, "Agnes Agent")
+        image_model = self.image_tab.current_model() if hasattr(self, "image_tab") else IMAGE_MODEL
+        models = (TEXT_MODEL, image_model, VIDEO_MODEL, "Agnes Agent")
         rail_titles = ("对话", "图像任务", "视频任务", "设置")
         self.stack.setCurrentIndex(index)
         session = self._active_session()
@@ -2809,8 +2831,9 @@ class MainWindow(QMainWindow):
 
 
 def run_self_test() -> None:
-    image = build_image_payload("edit", "1024x768", 7, ["https://example.com/a.png"])
-    assert image["tags"] == ["img2img"]
+    image = build_image_payload(IMAGE_MODEL, "edit", "1024x768", 7, ["https://example.com/a.png"])
+    assert image["model"] == IMAGE_MODEL_21
+    assert image["extra_body"]["image"] == ["https://example.com/a.png"]
     assert image["extra_body"]["response_format"] == "url"
     video = build_video_payload("move", "keyframes", ["a", "b"], 1152, 768, 121, 24, None, 8, "")
     assert video["extra_body"]["mode"] == "keyframes"

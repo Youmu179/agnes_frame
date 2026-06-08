@@ -9,7 +9,7 @@ An unofficial desktop shell for testing Agnes free models from a simple Agent-st
 ## Features
 
 - Chat Agent: `agnes-2.0-flash`, multi-turn chat, streaming output, optional Thinking / Reasoning panel.
-- Image Studio: `agnes-image-2.0-flash`, text-to-image, URL image editing, multi-image composition, preview and save.
+- Image Studio: defaults to the free `agnes-image-2.1-flash`, with `agnes-image-2.0-flash` still selectable; text-to-image, URL image editing, multi-image composition, preview and save.
 - Video Studio: `agnes-video-v2.0`, text-to-video, image-to-video, multi-image video, keyframe animation, async polling.
 
 ## Use The Release EXE
@@ -61,6 +61,7 @@ dist\AgnesModelTester.exe
 
 - [Common API Docs](https://agnes-ai.com/doc/%E5%B8%B8%E7%94%A8%E6%8E%A5%E5%85%A5%E6%96%87%E6%A1%A3)
 - [Agnes-2.0-Flash](https://agnes-ai.com/doc/agnes-20-flash)
+- [Agnes Image 2.1 Flash](https://agnes-ai.com/doc/agnes-image-21-flash)
 - [Agnes-Image-2.0-Flash](https://agnes-ai.com/doc/agnes-image-20-flash)
 - [Agnes-Video-V2.0](https://agnes-ai.com/doc/agnes-video-v20)
 - [img.scdn.io API](https://img.scdn.io/api_docs.php)

@@ -9,7 +9,7 @@ English version: [README.en.md](README.en.md)
 ## 能做什么
 
 - 对话 Agent：调用 `agnes-2.0-flash`，支持多轮对话、流式输出、Thinking / Reasoning 折叠展示。
-- 图像工作室：调用 `agnes-image-2.0-flash`，支持文生图、URL 图生图、多图合成、预览和保存。
+- 图像工作室：默认调用免费的 `agnes-image-2.1-flash`，也可切换 `agnes-image-2.0-flash`；支持文生图、URL 图生图、多图合成、预览和保存。
 - 视频工作室：调用 `agnes-video-v2.0`，支持文生视频、图生视频、多图视频、关键帧动画、任务轮询。
 
 ## 下载后怎么用
@@ -84,6 +84,7 @@ dist\AgnesModelTester.exe
 
 - [常用接入文档](https://agnes-ai.com/doc/%E5%B8%B8%E7%94%A8%E6%8E%A5%E5%85%A5%E6%96%87%E6%A1%A3)
 - [Agnes-2.0-Flash](https://agnes-ai.com/doc/agnes-20-flash)
+- [Agnes Image 2.1 Flash](https://agnes-ai.com/doc/agnes-image-21-flash)
 - [Agnes-Image-2.0-Flash](https://agnes-ai.com/doc/agnes-image-20-flash)
 - [Agnes-Video-V2.0](https://agnes-ai.com/doc/agnes-video-v20)
 - [img.scdn.io API](https://img.scdn.io/api_docs.php)
